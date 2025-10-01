@@ -28,6 +28,11 @@ FIREFLIES_API_KEY = os.getenv("FIREFLIES_API_KEY", "tu_api_key_aqui")
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
 # ========================= 
+# CONFIGURACIÓN URL PÚBLICA
+# =========================
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://form-trans-fireflies.onrender.com")
+
+# ========================= 
 # 1) Configuración de formato
 # ========================= 
 FONT_NAME = "Arial"
@@ -191,70 +196,18 @@ def is_interviewer_final(label: str) -> bool:
 # ========================= 
 # 6) FUNCIONES FIREFLIES
 # ========================= 
-async def get_upload_url_from_fireflies(filename: str, file_size: int) -> dict:
+
+# Directorio temporal para archivos
+TEMP_UPLOADS_DIR = Path("temp_uploads")
+TEMP_UPLOADS_DIR.mkdir(exist_ok=True)
+
+async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
     """
-    Obtiene una URL de subida pre-firmada desde Fireflies
+    Sube un archivo de audio/video a Fireflies mediante URL pública
     """
     mutation = """
-    mutation GenerateUploadUrl($filename: String!, $numBytes: Int!) {
-      generateUploadUrl(filename: $filename, num_bytes: $numBytes) {
-        uploadUrl
-        uploadHeaders
-        uploadId
-      }
-    }
-    """
-    
-    headers = {
-        'Authorization': f'Bearer {FIREFLIES_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            FIREFLIES_GRAPHQL_URL,
-            headers=headers,
-            json={
-                'query': mutation,
-                'variables': {
-                    'filename': filename,
-                    'numBytes': file_size
-                }
-            }
-        )
-        
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error al obtener URL de subida: {response.text}")
-        
-        result = response.json()
-        
-        if 'errors' in result:
-            raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
-        
-        return result['data']['generateUploadUrl']
-
-async def upload_to_presigned_url(upload_url: str, upload_headers: dict, file_content: bytes) -> bool:
-    """
-    Sube el archivo a la URL pre-firmada
-    """
-    headers_dict = json.loads(upload_headers) if isinstance(upload_headers, str) else upload_headers
-    
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        response = await client.put(
-            upload_url,
-            content=file_content,
-            headers=headers_dict
-        )
-        
-        return response.status_code in [200, 201, 204]
-
-async def create_transcript_from_upload(upload_id: str, title: str) -> str:
-    """
-    Crea la transcripción desde el archivo subido
-    """
-    mutation = """
-    mutation CreateTranscriptFromUpload($uploadId: String!, $title: String!) {
-      createTranscriptFromUpload(uploadId: $uploadId, title: $title) {
+    mutation UploadAudio($audioUrl: String!, $title: String!) {
+      uploadAudio(audio_url: $audioUrl, title: $title) {
         success
         title
         transcript_id
@@ -274,47 +227,46 @@ async def create_transcript_from_upload(upload_id: str, title: str) -> str:
             json={
                 'query': mutation,
                 'variables': {
-                    'uploadId': upload_id,
+                    'audioUrl': audio_url,
                     'title': title
                 }
             }
         )
         
         if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error al crear transcripción: {response.text}")
+            raise HTTPException(status_code=500, detail=f"Error al subir a Fireflies: {response.text}")
         
         result = response.json()
         
         if 'errors' in result:
             raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
         
-        transcript_id = result['data']['createTranscriptFromUpload']['transcript_id']
+        transcript_id = result['data']['uploadAudio']['transcript_id']
         return transcript_id
 
-async def upload_audio_to_fireflies(file_content: bytes, filename: str, interview_type: str) -> str:
+def save_temp_file(file_content: bytes, filename: str) -> tuple[str, str]:
     """
-    Sube un archivo de audio/video a Fireflies usando upload pre-firmado
+    Guarda el archivo temporalmente y retorna el path y token
     """
-    file_size = len(file_content)
+    file_token = str(uuid.uuid4())
+    extension = Path(filename).suffix
+    temp_filename = f"{file_token}{extension}"
+    temp_path = TEMP_UPLOADS_DIR / temp_filename
     
-    # Paso 1: Obtener URL de subida pre-firmada
-    upload_info = await get_upload_url_from_fireflies(filename, file_size)
+    with open(temp_path, 'wb') as f:
+        f.write(file_content)
     
-    # Paso 2: Subir archivo a la URL pre-firmada
-    upload_success = await upload_to_presigned_url(
-        upload_info['uploadUrl'],
-        upload_info['uploadHeaders'],
-        file_content
-    )
-    
-    if not upload_success:
-        raise HTTPException(status_code=500, detail="Error al subir el archivo a Fireflies")
-    
-    # Paso 3: Crear transcripción desde el archivo subido
-    title = f"{interview_type} - {filename}"
-    transcript_id = await create_transcript_from_upload(upload_info['uploadId'], title)
-    
-    return transcript_id
+    return str(temp_path), file_token
+
+def cleanup_temp_file(file_path: str):
+    """
+    Elimina el archivo temporal
+    """
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        print(f"Error al eliminar archivo temporal: {e}")
 
 async def check_transcription_status(transcript_id: str) -> dict:
     """
@@ -637,6 +589,7 @@ async def subir_audio_fireflies(
     Paso 1: Sube un archivo de audio/video a Fireflies para transcripción.
     Retorna un job_id para consultar el estado.
     """
+    temp_path = None
     try:
         if not (file.filename.endswith('.mp3') or file.filename.endswith('.mp4')):
             raise HTTPException(status_code=400, detail="El archivo debe ser MP3 o MP4")
@@ -646,27 +599,61 @@ async def subir_audio_fireflies(
         if len(file_content) > 1.5 * 1024 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="El archivo no debe superar 1.5 GB")
         
-        transcript_id = await upload_audio_to_fireflies(file_content, file.filename, interview_type)
+        # Guardar archivo temporalmente
+        temp_path, file_token = save_temp_file(file_content, file.filename)
+        extension = Path(file.filename).suffix
         
+        # Construir URL pública usando la configuración
+        public_url = f"{PUBLIC_BASE_URL}/temp_audio/{file_token}{extension}"
+        
+        print(f"URL pública generada: {public_url}")  # Para debug
+        
+        # Subir a Fireflies mediante URL
+        title = f"{interview_type} - {file.filename}"
+        transcript_id = await upload_audio_to_fireflies_via_url(public_url, title)
+        
+        # Crear job_id
         job_id = str(uuid.uuid4())
         
+        # Guardar información del job
         TRANSCRIPTION_JOBS[job_id] = {
             'transcript_id': transcript_id,
             'interview_type': interview_type,
             'filename': file.filename,
             'status': 'processing',
-            'created_at': datetime.utcnow()
+            'created_at': datetime.utcnow(),
+            'temp_path': temp_path,
+            'file_token': file_token
         }
         
         return JSONResponse(content={
             'job_id': job_id,
             'transcript_id': transcript_id,
             'status': 'processing',
-            'message': 'Audio subido exitosamente. La transcripción está en proceso.'
+            'message': 'Audio subido exitosamente. La transcripción está en proceso.',
+            'public_url': public_url  # Para verificar que la URL sea correcta
         })
         
     except Exception as e:
+        # Limpiar archivo temporal si hay error
+        if temp_path:
+            cleanup_temp_file(temp_path)
         raise HTTPException(status_code=500, detail=f"Error al subir audio: {str(e)}")
+
+@app.get("/temp_audio/{file_token}")
+async def serve_temp_audio(file_token: str):
+    """
+    Sirve archivos temporales para que Fireflies los descargue
+    """
+    # Buscar el archivo en el directorio temporal
+    for temp_file in TEMP_UPLOADS_DIR.glob(f"{file_token}.*"):
+        if temp_file.is_file():
+            return StreamingResponse(
+                open(temp_file, 'rb'),
+                media_type='application/octet-stream'
+            )
+    
+    raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
 @app.get("/fireflies/estado_transcripcion/{job_id}")
 async def estado_transcripcion(job_id: str):
@@ -747,7 +734,8 @@ async def detectar_etiquetas_fireflies(job_id: str):
 @app.post("/fireflies/formatear/{job_id}")
 async def formatear_desde_fireflies(
     job_id: str,
-    label_mapping: str = Form("null")
+    label_mapping: str = Form("null"),
+    background_tasks: BackgroundTasks = None
 ):
     """
     Paso 4: Formatea el documento generado por Fireflies con el mapeo seleccionado.
@@ -800,6 +788,10 @@ async def formatear_desde_fireflies(
         token = str(uuid.uuid4())
         expiration = datetime.utcnow() + timedelta(minutes=EXP_MINUTES)
         DOWNLOADS[token] = (zip_buffer, expiration)
+        
+        # Limpiar archivo temporal en background
+        if 'temp_path' in job and background_tasks:
+            background_tasks.add_task(cleanup_temp_file, job['temp_path'])
         
         TRANSCRIPTION_JOBS.pop(job_id, None)
         
@@ -922,4 +914,5 @@ async def descargar_archivo(token: str):
     )
     
     return response
+
 
