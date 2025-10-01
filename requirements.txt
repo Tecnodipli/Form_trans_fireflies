@@ -2,5 +2,5 @@ fastapi
 uvicorn[standard]
 python-docx
 python-multipart
-requests
+httpx
 
