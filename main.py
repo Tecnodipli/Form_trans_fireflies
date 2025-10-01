@@ -191,13 +191,70 @@ def is_interviewer_final(label: str) -> bool:
 # ========================= 
 # 6) FUNCIONES FIREFLIES
 # ========================= 
-async def upload_audio_to_fireflies(file_content: bytes, filename: str, interview_type: str) -> str:
+async def get_upload_url_from_fireflies(filename: str, file_size: int) -> dict:
     """
-    Sube un archivo de audio/video a Fireflies y retorna el transcript_id
+    Obtiene una URL de subida pre-firmada desde Fireflies
     """
     mutation = """
-    mutation UploadAudio($input: UploadAudioInput!) {
-      uploadAudio(input: $input) {
+    mutation GenerateUploadUrl($filename: String!, $numBytes: Int!) {
+      generateUploadUrl(filename: $filename, num_bytes: $numBytes) {
+        uploadUrl
+        uploadHeaders
+        uploadId
+      }
+    }
+    """
+    
+    headers = {
+        'Authorization': f'Bearer {FIREFLIES_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            FIREFLIES_GRAPHQL_URL,
+            headers=headers,
+            json={
+                'query': mutation,
+                'variables': {
+                    'filename': filename,
+                    'numBytes': file_size
+                }
+            }
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Error al obtener URL de subida: {response.text}")
+        
+        result = response.json()
+        
+        if 'errors' in result:
+            raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
+        
+        return result['data']['generateUploadUrl']
+
+async def upload_to_presigned_url(upload_url: str, upload_headers: dict, file_content: bytes) -> bool:
+    """
+    Sube el archivo a la URL pre-firmada
+    """
+    headers_dict = json.loads(upload_headers) if isinstance(upload_headers, str) else upload_headers
+    
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        response = await client.put(
+            upload_url,
+            content=file_content,
+            headers=headers_dict
+        )
+        
+        return response.status_code in [200, 201, 204]
+
+async def create_transcript_from_upload(upload_id: str, title: str) -> str:
+    """
+    Crea la transcripción desde el archivo subido
+    """
+    mutation = """
+    mutation CreateTranscriptFromUpload($uploadId: String!, $title: String!) {
+      createTranscriptFromUpload(uploadId: $uploadId, title: $title) {
         success
         title
         transcript_id
@@ -205,41 +262,59 @@ async def upload_audio_to_fireflies(file_content: bytes, filename: str, intervie
     }
     """
     
-    files = {
-        'operations': (None, json.dumps({
-            'query': mutation,
-            'variables': {
-                'input': {
-                    'title': f"{interview_type} - {filename}",
-                    'audio_file': None
-                }
-            }
-        })),
-        'map': (None, json.dumps({'0': ['variables.input.audio_file']})),
-        '0': (filename, file_content, 'audio/mpeg' if filename.endswith('.mp3') else 'video/mp4')
-    }
-    
     headers = {
-        'Authorization': f'Bearer {FIREFLIES_API_KEY}'
+        'Authorization': f'Bearer {FIREFLIES_API_KEY}',
+        'Content-Type': 'application/json'
     }
     
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
             FIREFLIES_GRAPHQL_URL,
             headers=headers,
-            files=files
+            json={
+                'query': mutation,
+                'variables': {
+                    'uploadId': upload_id,
+                    'title': title
+                }
+            }
         )
         
         if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error al subir a Fireflies: {response.text}")
+            raise HTTPException(status_code=500, detail=f"Error al crear transcripción: {response.text}")
         
         result = response.json()
         
         if 'errors' in result:
             raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
         
-        transcript_id = result['data']['uploadAudio']['transcript_id']
+        transcript_id = result['data']['createTranscriptFromUpload']['transcript_id']
         return transcript_id
+
+async def upload_audio_to_fireflies(file_content: bytes, filename: str, interview_type: str) -> str:
+    """
+    Sube un archivo de audio/video a Fireflies usando upload pre-firmado
+    """
+    file_size = len(file_content)
+    
+    # Paso 1: Obtener URL de subida pre-firmada
+    upload_info = await get_upload_url_from_fireflies(filename, file_size)
+    
+    # Paso 2: Subir archivo a la URL pre-firmada
+    upload_success = await upload_to_presigned_url(
+        upload_info['uploadUrl'],
+        upload_info['uploadHeaders'],
+        file_content
+    )
+    
+    if not upload_success:
+        raise HTTPException(status_code=500, detail="Error al subir el archivo a Fireflies")
+    
+    # Paso 3: Crear transcripción desde el archivo subido
+    title = f"{interview_type} - {filename}"
+    transcript_id = await create_transcript_from_upload(upload_info['uploadId'], title)
+    
+    return transcript_id
 
 async def check_transcription_status(transcript_id: str) -> dict:
     """
@@ -847,3 +922,4 @@ async def descargar_archivo(token: str):
     )
     
     return response
+
