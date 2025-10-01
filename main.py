@@ -1,84 +1,60 @@
+# main.py
+# -*- coding: utf-8 -*-
 import os
-import io
 import re
-import time
-import uuid
 import zipfile
-import requests
-from pathlib import Path
+import io
+import uuid
+import json
+import time
+import httpx
+import asyncio
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
-from collections import OrderedDict
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.staticfiles import StaticFiles
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
+# ========================= 
+# CONFIGURACIÓN FIREFLIES
 # =========================
-# Configuración Fireflies
-# =========================
-FIREFLIES_API_KEY = os.getenv("FIREFLIES_API_KEY", "<TU_API_KEY>")
+FIREFLIES_API_KEY = os.getenv("FIREFLIES_API_KEY", "tu_api_key_aqui")
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
-# Cambia esto al dominio real de tu Render
-BASE_URL = os.getenv("BASE_URL", "https://tu-app.onrender.com")
+# ========================= 
+# 1) Configuración de formato
+# ========================= 
+FONT_NAME = "Arial"
+FONT_SIZE_PT = 12
+SPACE_AFTER_LABEL_PT = 12
 
-# =========================
-# Configuración FastAPI
-# =========================
-ALLOWED_ORIGINS = [
-    "https://www.dipli.ai",
-    "https://dipli.ai",
-    "https://isagarcivill09.wixsite.com/turop",
-    "https://isagarcivill09.wixsite.com/turop/tienda",
-    "https://isagarcivill09-wixsite-com.filesusr.com",
-    "https://www.dipli.ai/preparaci%C3%B3n",
-    "https://www-dipli-ai.filesusr.com"
-]
-
-app = FastAPI(title="Fireflies + Formateador (Render)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ========================= 
+# 2) Patrones robustos
+# ========================= 
+TIME_ONLY = re.compile(r'^\s*\(?\d{1,2}:\d{2}(?::\d{2})?\)?\s*$')
+INLINE_LABEL = re.compile(
+    r'^\s*(?:\(?\d{1,2}:\d{2}(?::\d{2})?\)?\s*)?'
+    r'(speaker\s*\d+)\s*:?\s*(\S.+)$',
+    re.IGNORECASE
+)
+LABEL_ONLY = re.compile(
+    r'^\s*(?:\(?\d{1,2}:\d{2}(?::\d{2})?\)?\s*)?'
+    r'(speaker\s*\d+)\s*:?\s*$',
+    re.IGNORECASE
 )
 
-Path("uploads").mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# ========================= 
+# 3) Utilidades de texto/docx
+# ========================= 
+def paragraph_text(p: Paragraph) -> str:
+    return ''.join(r.text for r in p.runs) if p.runs else p.text
 
-DOWNLOADS = {}
-EXP_MINUTES = 10
-
-# =========================
-# Helpers Fireflies
-# =========================
-def fireflies_query(query: str, variables: dict = None):
-    headers = {"Authorization": f"Bearer {FIREFLIES_API_KEY}"}
-    r = requests.post(
-        FIREFLIES_GRAPHQL_URL,
-        headers=headers,
-        json={"query": query, "variables": variables or {}}
-    )
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Error Fireflies: {r.text}")
-    data = r.json()
-    if "errors" in data:
-        raise HTTPException(status_code=500, detail=f"Fireflies GraphQL error: {data['errors']}")
-    return data["data"]
-
-def get_public_url(file_path: Path) -> str:
-    """Construye la URL pública usando Render"""
-    return f"{BASE_URL}/uploads/{file_path.name}"
-
-# =========================
-# Helpers Formateador
-# =========================
 def normalize_label(lbl: str) -> str:
     return re.sub(r'\s+', ' ', (lbl or '')).strip().casefold()
 
@@ -91,145 +67,783 @@ def ensure_colon_upper(s: str) -> str:
 def clear_paragraph(p: Paragraph):
     p.text = ''
 
-def set_spacing(p: Paragraph, after_pt=12, before_pt=0):
+def set_spacing(p: Paragraph, after_pt=SPACE_AFTER_LABEL_PT, before_pt=0):
     pf = p.paragraph_format
-    pf.space_before = Pt(before_pt)
-    pf.space_after = Pt(after_pt)
+    if before_pt is not None:
+        pf.space_before = Pt(before_pt)
+    if after_pt is not None:
+        pf.space_after = Pt(after_pt)
 
-def write_label_plus_content(p: Paragraph, final_label: str, content: str, bold_label: bool):
+def write_label_plus_content(
+    p: Paragraph,
+    final_label: str,
+    content: str,
+    bold_label: bool,
+    bold_content: bool,
+    apply_spacing: bool = True,
+):
+    content = re.sub(r'\s+', ' ', content or '').strip()
     clear_paragraph(p)
     r1 = p.add_run(final_label + ' ')
     r1.bold = bold_label
-    r2 = p.add_run(content.strip())
-    r2.bold = bold_label
-    set_spacing(p)
+    r2 = p.add_run(content)
+    r2.bold = bold_content
+    if apply_spacing:
+        set_spacing(p, after_pt=SPACE_AFTER_LABEL_PT)
 
-def apply_global_font(doc: Document, name="Arial", size_pt=12):
+def bold_whole_paragraph(p: Paragraph):
+    if not p.runs:
+        if p.text:
+            txt = p.text
+            clear_paragraph(p)
+            r = p.add_run(txt)
+            r.bold = True
+        return
+    for r in p.runs:
+        r.bold = True
+
+def is_time_only(p: Paragraph) -> bool:
+    return bool(TIME_ONLY.match(paragraph_text(p).strip()))
+
+def is_label_start(p: Paragraph):
+    txt = paragraph_text(p)
+    m = INLINE_LABEL.match(txt)
+    if m:
+        return ('inline', m.group(1), m.group(2))
+    m = LABEL_ONLY.match(txt)
+    if m:
+        return ('only', m.group(1), None)
+    return None
+
+def apply_global_font(doc: Document, name=FONT_NAME, size_pt=FONT_SIZE_PT):
+    try:
+        doc.styles['Normal'].font.name = name
+        doc.styles['Normal'].font.size = Pt(size_pt)
+    except Exception:
+        pass
+    
     for p in doc.paragraphs:
         for r in p.runs:
             r.font.name = name
             if r._element.rPr is not None:
                 r._element.rPr.rFonts.set(qn('w:eastAsia'), name)
             r.font.size = Pt(size_pt)
+    
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        r.font.name = name
+                        if r._element.rPr is not None:
+                            r._element.rPr.rFonts.set(qn('w:eastAsia'), name)
+                        r.font.size = Pt(size_pt)
 
-def process_docx(doc_stream: io.BytesIO, interview_type: str) -> (io.BytesIO, io.BytesIO):
-    doc = Document(doc_stream)
-    labels_detected = []
-    changed = 0
+def fmt_hms(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
-    for p in doc.paragraphs:
-        txt = p.text.strip()
-        if txt.lower().startswith("speaker"):
-            final_label = ensure_colon_upper(txt.split(":")[0])
-            write_label_plus_content(p, final_label, txt.split(":")[-1], bold_label=True)
-            labels_detected.append(final_label)
-            changed += 1
+# ========================= 
+# 4) Registro (TXT) y guardado seguro (en memoria)
+# ========================= 
+def write_txt_control_report_in_memory(log: dict, turn_logs: list):
+    lines = []
+    lines.append("REGISTRO DE CONTROL Y PROCESO")
+    lines.append("=" * 34)
+    lines.append(f"Fecha de procesamiento: {log['ts']}")
+    lines.append(f"Archivo de entrada: {log['input_file']}")
+    lines.append(f"Párrafos totales: {log['total_paragraphs']}")
+    lines.append(f"Etiquetas detectadas: {', '.join(log['labels_detected']) if log['labels_detected'] else '—'}")
+    lines.append(f"Párrafos actualizados: {log['changed_count']}")
+    lines.append(f"Timestamps detectados: {log['time_only_count']}")
+    lines.append(f"Duración TOTAL: {log['exec_total_hms']} ({log['exec_total_seconds']:.3f}s)")
+    lines.append(f"Duración de PROCESAMIENTO: {log['exec_processing_hms']} ({log['exec_processing_seconds']:.3f}s)")
+    lines.append("")
+    lines.append("Mapeo aplicado (detectada -> final | turnos):")
+    for k, raw in log['mapping_raw_order']:
+        final = log['mapping'][k]
+        cnt = log['counts_by_final'][final]
+        lines.append(f"- {raw} -> {final} | {cnt}")
+    lines.append("")
+    lines.append("Detalle por turno:")
+    lines.append("index\traw_label\tfinal_label\tcase\tcontent_found\tinterviewer\tstart_par\tend_par")
+    for row in turn_logs:
+        lines.append(f"{row['index']}\t{row['raw_label']}\t{row['final_label']}\t{row['kind']}\t{row['content_found']}\t{row['interviewer']}\t{row['start_par']}\t{row['end_par']}")
+    
+    return "\n".join(lines)
 
-    apply_global_font(doc)
+# ========================= 
+# 5) Helpers de roles
+# ========================= 
+def normalize_role_label(label: str) -> str:
+    s = re.sub(r'\s+', ' ', (label or '')).strip()
+    if s.endswith(':'):
+        s = s[:-1]
+    return s.casefold()
 
-    out_docx = io.BytesIO()
-    doc.save(out_docx)
-    out_docx.seek(0)
+def is_interviewer_final(label: str) -> bool:
+    norm = normalize_role_label(label)
+    return 'entrevistador' in norm
 
-    # Reporte TXT
-    report = f"Entrevista: {interview_type}\nEtiquetas: {', '.join(labels_detected)}\nParrafos actualizados: {changed}"
-    out_txt = io.BytesIO(report.encode("utf-8"))
-    out_txt.seek(0)
-
-    return out_docx, out_txt
-
-# =========================
-# Endpoint: Procesar Audio
-# =========================
-@app.post("/procesar_audio/")
-async def procesar_audio(file: UploadFile = File(...), interview_type: str = Form(...)):
-    if not file.filename.endswith((".mp3", ".mp4")):
-        raise HTTPException(status_code=400, detail="El archivo debe ser .mp3 o .mp4")
-
-    temp_path = Path("uploads") / file.filename
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-
-    audio_url = get_public_url(temp_path)
-
+# ========================= 
+# 6) FUNCIONES FIREFLIES
+# ========================= 
+async def upload_audio_to_fireflies(file_content: bytes, filename: str, interview_type: str) -> str:
+    """
+    Sube un archivo de audio/video a Fireflies y retorna el transcript_id
+    """
     mutation = """
-    mutation CreateTranscript($audioUrl: String!) {
-      createTranscript(audio_url: $audioUrl) {
-        id
-        status
-        transcript_url
-        docx_download_url
+    mutation UploadAudio($input: UploadAudioInput!) {
+      uploadAudio(input: $input) {
+        success
+        title
+        transcript_id
       }
     }
     """
-    data = fireflies_query(mutation, {"audioUrl": audio_url})
-    transcript_id = data["createTranscript"]["id"]
+    
+    files = {
+        'operations': (None, json.dumps({
+            'query': mutation,
+            'variables': {
+                'input': {
+                    'title': f"{interview_type} - {filename}",
+                    'audio_file': None
+                }
+            }
+        })),
+        'map': (None, json.dumps({'0': ['variables.input.audio_file']})),
+        '0': (filename, file_content, 'audio/mpeg' if filename.endswith('.mp3') else 'video/mp4')
+    }
+    
+    headers = {
+        'Authorization': f'Bearer {FIREFLIES_API_KEY}'
+    }
+    
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            FIREFLIES_GRAPHQL_URL,
+            headers=headers,
+            files=files
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Error al subir a Fireflies: {response.text}")
+        
+        result = response.json()
+        
+        if 'errors' in result:
+            raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
+        
+        transcript_id = result['data']['uploadAudio']['transcript_id']
+        return transcript_id
 
-    query_status = """
-    query GetTranscript($id: ID!) {
-      transcript(id: $id) {
+async def check_transcription_status(transcript_id: str) -> dict:
+    """
+    Verifica el estado de la transcripción
+    """
+    query = """
+    query Transcript($transcriptId: String!) {
+      transcript(id: $transcriptId) {
         id
-        status
+        title
         transcript_url
-        docx_download_url
+        audio_url
+        date
+        duration
+        sentences {
+          text
+          speaker_name
+          start_time
+          end_time
+        }
       }
     }
     """
+    
+    headers = {
+        'Authorization': f'Bearer {FIREFLIES_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            FIREFLIES_GRAPHQL_URL,
+            headers=headers,
+            json={
+                'query': query,
+                'variables': {'transcriptId': transcript_id}
+            }
+        )
+        
+        if response.status_code != 200:
+            return {'status': 'error', 'message': response.text}
+        
+        result = response.json()
+        
+        if 'errors' in result:
+            return {'status': 'error', 'message': result['errors']}
+        
+        transcript_data = result['data']['transcript']
+        
+        if transcript_data and transcript_data.get('sentences'):
+            return {'status': 'completed', 'data': transcript_data}
+        else:
+            return {'status': 'processing'}
 
-    status = "processing"
-    docx_url = None
-    while status not in ("completed", "failed"):
-        time.sleep(10)
-        data = fireflies_query(query_status, {"id": transcript_id})
-        status = data["transcript"]["status"]
-        docx_url = data["transcript"].get("docx_download_url")
+def create_docx_from_fireflies(transcript_data: dict) -> io.BytesIO:
+    """
+    Crea un documento .docx a partir de la transcripción de Fireflies
+    """
+    doc = Document()
+    
+    current_speaker = None
+    current_text = []
+    
+    for sentence in transcript_data['sentences']:
+        speaker = sentence['speaker_name'] or "Speaker Unknown"
+        text = sentence['text']
+        
+        if speaker != current_speaker:
+            if current_speaker and current_text:
+                p = doc.add_paragraph()
+                p.add_run(f"{current_speaker}:").bold = True
+                p.add_run(" " + " ".join(current_text))
+            
+            current_speaker = speaker
+            current_text = [text]
+        else:
+            current_text.append(text)
+    
+    if current_speaker and current_text:
+        p = doc.add_paragraph()
+        p.add_run(f"{current_speaker}:").bold = True
+        p.add_run(" " + " ".join(current_text))
+    
+    docx_stream = io.BytesIO()
+    doc.save(docx_stream)
+    docx_stream.seek(0)
+    
+    return docx_stream
 
-    if status == "failed":
-        raise HTTPException(status_code=500, detail="Fireflies falló al procesar el audio.")
+# ========================= 
+# 7) Procesamiento principal (versión API)
+# ========================= 
+def process_file_api(file_stream: io.BytesIO, interview_type: str, label_mapping_user: dict = None, file_name: str = "file.docx"):
+    t0_total = time.perf_counter()
+    
+    doc = Document(file_stream)
+    
+    found_labels = OrderedDict()
+    for p in doc.paragraphs:
+        hit = is_label_start(p)
+        if hit:
+            _, raw_label, _ = hit
+            k = normalize_label(raw_label)
+            if k not in found_labels:
+                found_labels[k] = raw_label.strip()
+    
+    label_mapping = {}
+    if label_mapping_user:
+        for k, raw in found_labels.items():
+            if k in label_mapping_user:
+                final_label = ensure_colon_upper(label_mapping_user[k] or raw)
+            else:
+                final_label = ensure_colon_upper(raw)
+            label_mapping[k] = final_label
+    else:
+        for k, raw in found_labels.items():
+            label_mapping[k] = ensure_colon_upper(raw)
+    
+    t0_processing = time.perf_counter()
+    
+    i = 0
+    changed = 0
+    n = len(doc.paragraphs)
+    time_only_count = sum(1 for p in doc.paragraphs if is_time_only(p))
+    
+    counts_by_final = defaultdict(int)
+    turn_logs = []
+    
+    while i < n:
+        p = doc.paragraphs[i]
+        hit = is_label_start(p)
+        
+        if not hit:
+            i += 1
+            continue
+        
+        kind, raw_label, content_inline = hit
+        key = normalize_label(raw_label)
+        final_label = label_mapping.get(key)
+        
+        if not final_label:
+            i += 1
+            continue
+        
+        is_interviewer = is_interviewer_final(final_label)
+        bold_label_flag = is_interviewer
+        bold_content_flag = is_interviewer
+        
+        start_par = i
+        content_found = False
+        end_par = i
+        
+        if kind == 'inline':
+            write_label_plus_content(p, final_label, content_inline, bold_label_flag, bold_content_flag, apply_spacing=True)
+            content_found = True
+            changed += 1
+            counts_by_final[final_label] += 1
+            turn_logs.append({
+                'index': len(turn_logs) + 1,
+                'raw_label': raw_label,
+                'final_label': final_label,
+                'kind': 'inline',
+                'content_found': content_found,
+                'interviewer': is_interviewer,
+                'start_par': start_par,
+                'end_par': end_par
+            })
+            i += 1
+            continue
+        
+        j = i + 1
+        while j < n:
+            txtj = paragraph_text(doc.paragraphs[j]).strip()
+            if not txtj or is_time_only(doc.paragraphs[j]):
+                j += 1
+                continue
+            if is_label_start(doc.paragraphs[j]):
+                break
+            break
+        
+        if j >= n or is_label_start(doc.paragraphs[j]) or not paragraph_text(doc.paragraphs[j]).strip() or is_time_only(doc.paragraphs[j]):
+            write_label_plus_content(p, final_label, "", bold_label_flag, bold_content_flag, apply_spacing=True)
+            changed += 1
+            counts_by_final[final_label] += 1
+            turn_logs.append({
+                'index': len(turn_logs) + 1,
+                'raw_label': raw_label,
+                'final_label': final_label,
+                'kind': 'only',
+                'content_found': False,
+                'interviewer': is_interviewer,
+                'start_par': start_par,
+                'end_par': start_par
+            })
+            i += 1
+            continue
+        
+        first_content = paragraph_text(doc.paragraphs[j])
+        write_label_plus_content(p, final_label, first_content, bold_label_flag, bold_content_flag, apply_spacing=True)
+        clear_paragraph(doc.paragraphs[j])
+        content_found = True
+        changed += 1
+        counts_by_final[final_label] += 1
+        
+        k = j + 1
+        last_non_time_idx = i
+        while k < n and not is_label_start(doc.paragraphs[k]):
+            if not is_time_only(doc.paragraphs[k]) and paragraph_text(doc.paragraphs[k]).strip():
+                last_non_time_idx = k
+                if is_interviewer:
+                    bold_whole_paragraph(doc.paragraphs[k])
+            k += 1
+        
+        set_spacing(doc.paragraphs[last_non_time_idx], after_pt=SPACE_AFTER_LABEL_PT)
+        end_par = last_non_time_idx
+        
+        turn_logs.append({
+            'index': len(turn_logs) + 1,
+            'raw_label': raw_label,
+            'final_label': final_label,
+            'kind': 'only+merge',
+            'content_found': content_found,
+            'interviewer': is_interviewer,
+            'start_par': start_par,
+            'end_par': end_par
+        })
+        
+        i = k
+    
+    apply_global_font(doc, name=FONT_NAME, size_pt=FONT_SIZE_PT)
+    
+    t1_total = time.perf_counter()
+    exec_total = t1_total - t0_total
+    exec_processing = t1_total - t0_processing
+    
+    log = {
+        'ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'input_file': file_name,
+        'total_paragraphs': len(doc.paragraphs),
+        'labels_detected': list(found_labels.values()),
+        'mapping': label_mapping,
+        'mapping_raw_order': list(found_labels.items()),
+        'changed_count': changed,
+        'time_only_count': time_only_count,
+        'counts_by_final': counts_by_final,
+        'exec_total_seconds': exec_total,
+        'exec_total_hms': fmt_hms(exec_total),
+        'exec_processing_seconds': exec_processing,
+        'exec_processing_hms': fmt_hms(exec_processing),
+    }
+    
+    docx_stream = io.BytesIO()
+    doc.save(docx_stream)
+    docx_stream.seek(0)
+    
+    txt_content = write_txt_control_report_in_memory(log, turn_logs)
+    txt_stream = io.BytesIO(txt_content.encode('utf-8'))
+    txt_stream.seek(0)
+    
+    return docx_stream, txt_stream
 
-    if not docx_url:
-        raise HTTPException(status_code=500, detail="Fireflies no devolvió un .docx")
+def detect_labels_api(file_stream: io.BytesIO):
+    doc = Document(file_stream)
+    
+    found_labels = OrderedDict()
+    for p in doc.paragraphs:
+        hit = is_label_start(p)
+        if hit:
+            _, raw_label, _ = hit
+            k = normalize_label(raw_label)
+            if k not in found_labels:
+                found_labels[k] = raw_label.strip()
+    
+    return list(found_labels.values())
 
-    r = requests.get(docx_url)
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail="No se pudo descargar el DOCX de Fireflies")
-    doc_stream = io.BytesIO(r.content)
+# ========================== 
+# FastAPI
+# ========================== 
+app = FastAPI(title="Formateador de Transcripciones con Fireflies")
 
-    final_docx, final_txt = process_docx(doc_stream, interview_type)
+ALLOWED_ORIGINS = [
+    "https://www.dipli.ai",
+    "https://dipli.ai",
+    "https://isagarcivill09.wixsite.com/turop",
+    "https://isagarcivill09.wixsite.com/turop/tienda",
+    "https://isagarcivill09-wixsite-com.filesusr.com",
+    "https://www.dipli.ai/preparaci%C3%B3n",
+    "https://www-dipli-ai.filesusr.com"
+]
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        zip_file.writestr("transcripcion_formateada.docx", final_docx.getvalue())
-        zip_file.writestr("registro_control.txt", final_txt.getvalue())
-    zip_buffer.seek(0)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    token = str(uuid.uuid4())
-    expiration = datetime.utcnow() + timedelta(minutes=EXP_MINUTES)
-    DOWNLOADS[token] = (zip_buffer, expiration)
+# Almacenamiento temporal
+DOWNLOADS = {}
+TRANSCRIPTION_JOBS = {}
+EXP_MINUTES = 30
 
-    return JSONResponse(content={
-        "message": "Transcripción lista",
-        "token": token,
-        "filename": "transcripcion_formateada.zip"
-    })
-
-# =========================
-# Endpoint de Descarga
-# =========================
-@app.get("/descargar/{token}")
-async def descargar_archivo(token: str):
+def cleanup_downloads():
     now = datetime.utcnow()
     expired = [t for t, (_, exp) in DOWNLOADS.items() if exp <= now]
     for t in expired:
         DOWNLOADS.pop(t, None)
 
-    if token not in DOWNLOADS:
-        raise HTTPException(status_code=404, detail="Token inválido o expirado")
+# ========================== 
+# ENDPOINTS FIREFLIES (FLUJO COMPLETO)
+# ========================== 
 
+@app.post("/fireflies/subir_audio/")
+async def subir_audio_fireflies(
+    file: UploadFile = File(...),
+    interview_type: str = Form(...)
+):
+    """
+    Paso 1: Sube un archivo de audio/video a Fireflies para transcripción.
+    Retorna un job_id para consultar el estado.
+    """
+    try:
+        if not (file.filename.endswith('.mp3') or file.filename.endswith('.mp4')):
+            raise HTTPException(status_code=400, detail="El archivo debe ser MP3 o MP4")
+        
+        file_content = await file.read()
+        
+        if len(file_content) > 1.5 * 1024 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="El archivo no debe superar 1.5 GB")
+        
+        transcript_id = await upload_audio_to_fireflies(file_content, file.filename, interview_type)
+        
+        job_id = str(uuid.uuid4())
+        
+        TRANSCRIPTION_JOBS[job_id] = {
+            'transcript_id': transcript_id,
+            'interview_type': interview_type,
+            'filename': file.filename,
+            'status': 'processing',
+            'created_at': datetime.utcnow()
+        }
+        
+        return JSONResponse(content={
+            'job_id': job_id,
+            'transcript_id': transcript_id,
+            'status': 'processing',
+            'message': 'Audio subido exitosamente. La transcripción está en proceso.'
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al subir audio: {str(e)}")
+
+@app.get("/fireflies/estado_transcripcion/{job_id}")
+async def estado_transcripcion(job_id: str):
+    """
+    Paso 2: Consulta el estado de una transcripción en proceso.
+    Llamar periódicamente hasta que status sea 'completed'.
+    """
+    if job_id not in TRANSCRIPTION_JOBS:
+        raise HTTPException(status_code=404, detail="Job ID no encontrado")
+    
+    job = TRANSCRIPTION_JOBS[job_id]
+    transcript_id = job['transcript_id']
+    
+    status_result = await check_transcription_status(transcript_id)
+    
+    if status_result['status'] == 'completed':
+        job['status'] = 'completed'
+        job['transcript_data'] = status_result['data']
+        
+        return JSONResponse(content={
+            'job_id': job_id,
+            'status': 'completed',
+            'message': 'Transcripción completada. Puede proceder a detectar etiquetas.'
+        })
+    
+    elif status_result['status'] == 'processing':
+        return JSONResponse(content={
+            'job_id': job_id,
+            'status': 'processing',
+            'message': 'La transcripción está en proceso. Por favor espere.'
+        })
+    
+    else:
+        job['status'] = 'error'
+        return JSONResponse(content={
+            'job_id': job_id,
+            'status': 'error',
+            'message': f"Error en la transcripción: {status_result.get('message', 'Error desconocido')}"
+        })
+
+@app.post("/fireflies/detectar_etiquetas/{job_id}")
+async def detectar_etiquetas_fireflies(job_id: str):
+    """
+    Paso 3: Genera el documento .docx desde Fireflies y detecta etiquetas para mapeo.
+    """
+    if job_id not in TRANSCRIPTION_JOBS:
+        raise HTTPException(status_code=404, detail="Job ID no encontrado")
+    
+    job = TRANSCRIPTION_JOBS[job_id]
+    
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="La transcripción aún no está completa")
+    
+    try:
+        docx_stream = create_docx_from_fireflies(job['transcript_data'])
+        
+        labels = detect_labels_api(docx_stream)
+        
+        docx_stream.seek(0)
+        job['docx_content'] = docx_stream.read()
+        
+        if not labels:
+            return JSONResponse(content={
+                'job_id': job_id,
+                'labels': [],
+                'message': 'Transcripción generada pero no se detectaron etiquetas Speaker N.'
+            })
+        
+        return JSONResponse(content={
+            'job_id': job_id,
+            'labels': labels,
+            'message': 'Etiquetas detectadas exitosamente'
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al detectar etiquetas: {str(e)}")
+
+@app.post("/fireflies/formatear/{job_id}")
+async def formatear_desde_fireflies(
+    job_id: str,
+    label_mapping: str = Form("null")
+):
+    """
+    Paso 4: Formatea el documento generado por Fireflies con el mapeo seleccionado.
+    """
+    if job_id not in TRANSCRIPTION_JOBS:
+        raise HTTPException(status_code=404, detail="Job ID no encontrado")
+    
+    job = TRANSCRIPTION_JOBS[job_id]
+    
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="La transcripción aún no está completa")
+    
+    if 'docx_content' not in job:
+        raise HTTPException(status_code=400, detail="Debe detectar etiquetas primero")
+    
+    try:
+        file_stream = io.BytesIO(job['docx_content'])
+        
+        mapping_data = None
+        if label_mapping and label_mapping != "null":
+            try:
+                mapping_data = json.loads(label_mapping)
+            except json.JSONDecodeError:
+                print("Advertencia: El 'label_mapping' no es un JSON válido.")
+        
+        if mapping_data:
+            mapping_data_normalized = {normalize_label(k): v for k, v in mapping_data.items()}
+        else:
+            mapping_data_normalized = None
+        
+        docx_stream, txt_stream = process_file_api(
+            file_stream=file_stream,
+            interview_type=job['interview_type'],
+            label_mapping_user=mapping_data_normalized,
+            file_name=job['filename']
+        )
+        
+        base_filename = Path(job['filename']).stem
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            docx_name = f"{base_filename}_formateado_FINAL.docx"
+            zip_file.writestr(docx_name, docx_stream.getvalue())
+            
+            txt_name = f"{base_filename}_registro_control_proceso.txt"
+            zip_file.writestr(txt_name, txt_stream.getvalue())
+        
+        zip_buffer.seek(0)
+        
+        token = str(uuid.uuid4())
+        expiration = datetime.utcnow() + timedelta(minutes=EXP_MINUTES)
+        DOWNLOADS[token] = (zip_buffer, expiration)
+        
+        TRANSCRIPTION_JOBS.pop(job_id, None)
+        
+        return JSONResponse(content={
+            'token': token,
+            'filename': f"{base_filename}_formateado.zip",
+            'message': 'Documento formateado exitosamente'
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al formatear: {str(e)}")
+
+# ========================== 
+# ENDPOINTS ORIGINALES (para subir .docx directamente)
+# ========================== 
+
+@app.post("/detectar_etiquetas/")
+async def detectar_etiquetas(file: UploadFile = File(...)):
+    """
+    Detecta etiquetas "Speaker N" en un documento .docx ya transcrito.
+    Usa POST para aceptar el archivo en el cuerpo de la solicitud.
+    """
+    try:
+        file_content = await file.read()
+        file_stream = io.BytesIO(file_content)
+        
+        labels = detect_labels_api(file_stream)
+        
+        if not labels:
+            return JSONResponse(content={
+                "labels": [],
+                "message": "No se detectaron etiquetas 'Speaker N'."
+            })
+        
+        return JSONResponse(content={"labels": labels})
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al detectar etiquetas: {e}")
+
+@app.post("/formatear/")
+async def formatear_transcripcion(
+    file: UploadFile = File(...),
+    interview_type: str = Form(...),
+    label_mapping: str = Form("null")
+):
+    """
+    Formatea un documento .docx ya transcrito y genera un archivo de registro.
+    Acepta el archivo y el mapeo de etiquetas en el cuerpo de la solicitud.
+    """
+    try:
+        if not file.filename.endswith('.docx'):
+            raise HTTPException(status_code=400, detail="El archivo debe ser un .docx")
+        
+        file_content = await file.read()
+        file_stream = io.BytesIO(file_content)
+        
+        mapping_data = None
+        if label_mapping and label_mapping != "null":
+            try:
+                mapping_data = json.loads(label_mapping)
+            except json.JSONDecodeError:
+                print("Advertencia: El 'label_mapping' no es un JSON válido. Se usará el formato por defecto.")
+        
+        if mapping_data:
+            mapping_data_normalized = {normalize_label(k): v for k, v in mapping_data.items()}
+        else:
+            mapping_data_normalized = None
+        
+        docx_stream, txt_stream = process_file_api(
+            file_stream=file_stream,
+            interview_type=interview_type,
+            label_mapping_user=mapping_data_normalized,
+            file_name=file.filename
+        )
+        
+        base_filename = Path(file.filename).stem
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            docx_name = f"{base_filename}_formateado_FINAL.docx"
+            zip_file.writestr(docx_name, docx_stream.getvalue())
+            
+            txt_name = f"{base_filename}_registro_control_proceso.txt"
+            zip_file.writestr(txt_name, txt_stream.getvalue())
+        
+        zip_buffer.seek(0)
+        
+        token = str(uuid.uuid4())
+        expiration = datetime.utcnow() + timedelta(minutes=EXP_MINUTES)
+        DOWNLOADS[token] = (zip_buffer, expiration)
+        
+        return JSONResponse(content={
+            "token": token,
+            "filename": f"{base_filename}_formateado.zip"
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en el procesamiento: {e}")
+
+@app.get("/descargar/{token}")
+async def descargar_archivo(token: str):
+    """
+    Paso 5: Permite la descarga de un archivo comprimido por un token.
+    Este endpoint sirve tanto para flujo Fireflies como para subida directa de .docx
+    """
+    cleanup_downloads()
+    
+    if token not in DOWNLOADS:
+        raise HTTPException(status_code=404, detail="Token de descarga no válido o expirado.")
+    
     zip_buffer, _ = DOWNLOADS.pop(token)
+    
     response = StreamingResponse(
         io.BytesIO(zip_buffer.getvalue()),
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=archivos_formateados.zip"}
+        headers={
+            "Content-Disposition": f"attachment; filename=archivos_formateados.zip",
+            "Content-Length": str(len(zip_buffer.getvalue()))
+        }
     )
+    
     return response
