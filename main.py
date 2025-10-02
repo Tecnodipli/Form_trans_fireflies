@@ -16,7 +16,7 @@ FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 PUBLIC_BASE_URL = "https://form-trans-fireflies.onrender.com"
 
 # ======================
-# 1. SUBIR AUDIO A FIRELIES
+# 1. SUBIR AUDIO A FIREFLIES
 # ======================
 
 async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
@@ -26,6 +26,7 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
         success
         title
         message
+        id
       }
     }
     """
@@ -61,40 +62,12 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
         if not upload_data["success"]:
             raise HTTPException(status_code=500, detail=f"Falló Fireflies: {upload_data['message']}")
 
-        return upload_data["title"]
+        # devolvemos el ID de la transcripción creada
+        return upload_data["id"]
 
 # ======================
 # 2. POLL TRANSCRIPCIÓN
 # ======================
-
-async def find_transcript_by_title(title: str):
-    query = """
-    query FindTranscriptByTitle($title: String!) {
-      transcripts(search: $title) {
-        id
-        title
-      }
-    }
-    """
-
-    headers = {"Authorization": f"Bearer {FIREFLIES_API_KEY}"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            FIREFLIES_GRAPHQL_URL,
-            headers=headers,
-            json={"query": query, "variables": {"title": title}}
-        )
-
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error buscar transcript: {resp.text}")
-
-        data = resp.json()
-        if "errors" in data:
-            raise HTTPException(status_code=500, detail=f"Error buscar transcript: {data['errors']}")
-
-        transcripts = data["data"]["transcripts"]
-        return transcripts[0]["id"] if transcripts else None
-
 
 async def check_transcription_status(transcript_id: str):
     query = """
@@ -188,18 +161,9 @@ async def subir_audio_fireflies(file: UploadFile = File(...), title: str = Form(
         public_url = f"{PUBLIC_BASE_URL}/temp_audio/{file_token}{extension}"
         print("URL pública generada:", public_url)
 
-        upload_title = await upload_audio_to_fireflies_via_url(public_url, title)
+        transcript_id = await upload_audio_to_fireflies_via_url(public_url, title)
 
         # esperar transcripción
-        transcript_id = None
-        for _ in range(30):
-            transcript_id = await find_transcript_by_title(upload_title)
-            if transcript_id:
-                break
-            await asyncio.sleep(5)
-        if not transcript_id:
-            raise HTTPException(status_code=500, detail="No se encontró transcript.")
-
         transcript = None
         for _ in range(60):
             transcript = await check_transcription_status(transcript_id)
@@ -240,3 +204,5 @@ async def download(file_token: str):
     if not matches:
         return JSONResponse(status_code=404, content={"message": "No encontrado"})
     return FileResponse(matches[0], filename=os.path.basename(matches[0]))
+
+
