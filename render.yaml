@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: formateador-transcripciones
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: FIREFLIES_API_KEY
+        sync: false
+      - key: RENDER_EXTERNAL_HOSTNAME
+        fromService:
+          type: web
+          name: formateador-transcripciones
+          property: host
+    disk:
+      name: temp-storage
+      mountPath: /opt/render/project/src/temp_audio
+      sizeGB: 1
