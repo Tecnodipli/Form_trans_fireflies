@@ -13,3 +13,6 @@ python-docx==1.1.2
 
 # Validación de datos
 pydantic==2.9.2
+
+# Necesario para manejar Form y File en FastAPI
+python-multipart==0.0.9
