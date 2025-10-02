@@ -206,11 +206,11 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
     Sube un archivo de audio/video a Fireflies mediante URL pública
     """
     mutation = """
-    mutation UploadAudio($audioUrl: String!, $title: String!) {
-      uploadAudio(audio_url: $audioUrl, title: $title) {
+    mutation UploadAudio($input: UploadAudioInput!) {
+      uploadAudio(input: $input) {
         success
         title
-        transcript_id
+        message
       }
     }
     """
@@ -227,8 +227,10 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
             json={
                 'query': mutation,
                 'variables': {
-                    'audioUrl': audio_url,
-                    'title': title
+                    'input': {
+                        'url': audio_url,
+                        'title': title
+                    }
                 }
             }
         )
@@ -241,32 +243,48 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
         if 'errors' in result:
             raise HTTPException(status_code=500, detail=f"Error de Fireflies: {result['errors']}")
         
-        transcript_id = result['data']['uploadAudio']['transcript_id']
-        return transcript_id
+        # Fireflies no retorna transcript_id inmediatamente, hay que buscarlo después
+        return title
 
-def save_temp_file(file_content: bytes, filename: str) -> tuple[str, str]:
+async def find_transcript_by_title(title: str, max_attempts: int = 20) -> Optional[str]:
     """
-    Guarda el archivo temporalmente y retorna el path y token
+    Busca una transcripción por título (puede tardar unos segundos en aparecer)
     """
-    file_token = str(uuid.uuid4())
-    extension = Path(filename).suffix
-    temp_filename = f"{file_token}{extension}"
-    temp_path = TEMP_UPLOADS_DIR / temp_filename
+    query = """
+    query Transcripts {
+      transcripts(limit: 50) {
+        id
+        title
+        date
+      }
+    }
+    """
     
-    with open(temp_path, 'wb') as f:
-        f.write(file_content)
+    headers = {
+        'Authorization': f'Bearer {FIREFLIES_API_KEY}',
+        'Content-Type': 'application/json'
+    }
     
-    return str(temp_path), file_token
-
-def cleanup_temp_file(file_path: str):
-    """
-    Elimina el archivo temporal
-    """
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception as e:
-        print(f"Error al eliminar archivo temporal: {e}")
+    for attempt in range(max_attempts):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                FIREFLIES_GRAPHQL_URL,
+                headers=headers,
+                json={'query': query}
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if 'data' in result and 'transcripts' in result['data']:
+                    for transcript in result['data']['transcripts']:
+                        if transcript['title'] == title:
+                            return transcript['id']
+        
+        # Esperar 3 segundos antes de reintentar
+        await asyncio.sleep(3)
+    
+    return None
 
 async def check_transcription_status(transcript_id: str) -> dict:
     """
@@ -355,6 +373,30 @@ def create_docx_from_fireflies(transcript_data: dict) -> io.BytesIO:
     docx_stream.seek(0)
     
     return docx_stream
+
+def save_temp_file(file_content: bytes, filename: str) -> tuple[str, str]:
+    """
+    Guarda el archivo temporalmente y retorna el path y token
+    """
+    file_token = str(uuid.uuid4())
+    extension = Path(filename).suffix
+    temp_filename = f"{file_token}{extension}"
+    temp_path = TEMP_UPLOADS_DIR / temp_filename
+    
+    with open(temp_path, 'wb') as f:
+        f.write(file_content)
+    
+    return str(temp_path), file_token
+
+def cleanup_temp_file(file_path: str):
+    """
+    Elimina el archivo temporal
+    """
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        print(f"Error al eliminar archivo temporal: {e}")
 
 # ========================= 
 # 7) Procesamiento principal (versión API)
@@ -606,11 +648,20 @@ async def subir_audio_fireflies(
         # Construir URL pública usando la configuración
         public_url = f"{PUBLIC_BASE_URL}/temp_audio/{file_token}{extension}"
         
-        print(f"URL pública generada: {public_url}")  # Para debug
+        print(f"URL pública generada: {public_url}")
         
         # Subir a Fireflies mediante URL
-        title = f"{interview_type} - {file.filename}"
-        transcript_id = await upload_audio_to_fireflies_via_url(public_url, title)
+        title = f"{interview_type} - {file.filename} - {file_token}"
+        upload_result = await upload_audio_to_fireflies_via_url(public_url, title)
+        
+        # Buscar el transcript_id (puede tardar unos segundos)
+        print("Buscando transcript_id...")
+        transcript_id = await find_transcript_by_title(title)
+        
+        if not transcript_id:
+            raise HTTPException(status_code=500, detail="No se pudo obtener el transcript_id. Intenta de nuevo en unos segundos.")
+        
+        print(f"Transcript ID encontrado: {transcript_id}")
         
         # Crear job_id
         job_id = str(uuid.uuid4())
@@ -623,7 +674,8 @@ async def subir_audio_fireflies(
             'status': 'processing',
             'created_at': datetime.utcnow(),
             'temp_path': temp_path,
-            'file_token': file_token
+            'file_token': file_token,
+            'title': title
         }
         
         return JSONResponse(content={
@@ -631,11 +683,10 @@ async def subir_audio_fireflies(
             'transcript_id': transcript_id,
             'status': 'processing',
             'message': 'Audio subido exitosamente. La transcripción está en proceso.',
-            'public_url': public_url  # Para verificar que la URL sea correcta
+            'public_url': public_url
         })
         
     except Exception as e:
-        # Limpiar archivo temporal si hay error
         if temp_path:
             cleanup_temp_file(temp_path)
         raise HTTPException(status_code=500, detail=f"Error al subir audio: {str(e)}")
@@ -915,4 +966,32 @@ async def descargar_archivo(token: str):
     
     return response
 
+# ========================== 
+# ENDPOINT DE SALUD
+# ========================== 
 
+@app.get("/")
+async def root():
+    """
+    Endpoint de salud para verificar que la API está funcionando
+    """
+    return {
+        "message": "API Formateador de Transcripciones con Fireflies",
+        "status": "online",
+        "version": "2.0",
+        "endpoints": {
+            "fireflies": [
+                "POST /fireflies/subir_audio/",
+                "GET /fireflies/estado_transcripcion/{job_id}",
+                "POST /fireflies/detectar_etiquetas/{job_id}",
+                "POST /fireflies/formatear/{job_id}"
+            ],
+            "direct": [
+                "POST /detectar_etiquetas/",
+                "POST /formatear/"
+            ],
+            "common": [
+                "GET /descargar/{token}"
+            ]
+        }
+    }
