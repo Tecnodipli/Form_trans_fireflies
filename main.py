@@ -1,24 +1,40 @@
 import os
-import httpx
-import aiofiles
 import uuid
-import glob
+import aiofiles
+import httpx
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from docx import Document
-from docx.shared import Pt
 
 app = FastAPI()
 
+# 🔑 Configuración Fireflies
 FIREFLIES_API_KEY = os.getenv("FIREFLIES_API_KEY")
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
-PUBLIC_BASE_URL = "https://form-trans-fireflies.onrender.com"
 
-# ======================
-# 1. SUBIR AUDIO A FIREFLIES
-# ======================
+# Carpeta temporal para guardar audios
+TEMP_DIR = "temp_audio"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
+
+# ==============================
+# 📌 Guardar audio en servidor
+# ==============================
+async def save_temp_file(upload_file: UploadFile) -> str:
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(TEMP_DIR, f"{file_id}.mp3")
+
+    async with aiofiles.open(file_path, "wb") as out_file:
+        content = await upload_file.read()
+        await out_file.write(content)
+
+    return file_path
+
+
+# ==============================
+# 📌 Subir audio a Fireflies
+# ==============================
 async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
     mutation = """
     mutation UploadAudio($input: AudioUploadInput!) {
@@ -26,7 +42,6 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
         success
         title
         message
-        id
       }
     }
     """
@@ -42,12 +57,7 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
             headers=headers,
             json={
                 "query": mutation,
-                "variables": {
-                    "input": {
-                        "url": audio_url,
-                        "title": title
-                    }
-                }
+                "variables": {"input": {"url": audio_url, "title": title}}
             }
         )
 
@@ -62,147 +72,140 @@ async def upload_audio_to_fireflies_via_url(audio_url: str, title: str) -> str:
         if not upload_data["success"]:
             raise HTTPException(status_code=500, detail=f"Falló Fireflies: {upload_data['message']}")
 
-        # devolvemos el ID de la transcripción creada
-        return upload_data["id"]
+        return title  # usamos title para buscar después
 
-# ======================
-# 2. POLL TRANSCRIPCIÓN
-# ======================
 
-async def check_transcription_status(transcript_id: str):
+# ==============================
+# 📌 Buscar transcript por título
+# ==============================
+async def find_transcript_by_title(title: str):
     query = """
-    query Transcript($id: ID!) {
-      transcript(id: $id) {
+    query {
+      transcripts {
         id
         title
-        sentences {
-          speaker_name
+        status
+        createdAt
+      }
+    }
+    """
+
+    headers = {
+        "Authorization": f"Bearer {FIREFLIES_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            FIREFLIES_GRAPHQL_URL,
+            headers=headers,
+            json={"query": query}
+        )
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        if "errors" in data:
+            return None
+
+        transcripts = data["data"]["transcripts"]
+        for t in transcripts:
+            if t["title"] == title:
+                return t["id"]
+
+    return None
+
+
+# ==============================
+# 📌 Obtener contenido del transcript
+# ==============================
+async def get_transcript_text(transcript_id: str) -> str:
+    query = """
+    query GetTranscript($id: String!) {
+      transcript(id: $id) {
+        status
+        words {
           text
         }
       }
     }
     """
-    headers = {"Authorization": f"Bearer {FIREFLIES_API_KEY}"}
+
+    headers = {
+        "Authorization": f"Bearer {FIREFLIES_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
+        response = await client.post(
             FIREFLIES_GRAPHQL_URL,
             headers=headers,
             json={"query": query, "variables": {"id": transcript_id}}
         )
 
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error status: {resp.text}")
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Error transcript: {response.text}")
 
-        data = resp.json()
+        data = response.json()
         if "errors" in data:
-            raise HTTPException(status_code=500, detail=f"Error status: {data['errors']}")
+            raise HTTPException(status_code=500, detail=f"Error transcript: {data['errors']}")
 
-        return data["data"]["transcript"]
+        transcript = data["data"]["transcript"]
+        if transcript["status"] != "completed":
+            return None
 
-# ======================
-# 3. PROCESAR ARCHIVO .DOCX
-# ======================
+        text = " ".join([w["text"] for w in transcript["words"]])
+        return text
 
-def process_file_api(file_path: str, output_docx_path: str, mapping: dict = None):
-    doc = Document(file_path)
-    content = []
-    speaker_map = mapping or {}
-    interviewee = speaker_map.get("Entrevistado", "Entrevistado")
-    interviewer = speaker_map.get("Entrevistador", "Entrevistador")
 
-    # recolectar texto
-    for para in doc.paragraphs:
-        if ":" in para.text:
-            speaker, text = para.text.split(":", 1)
-            speaker = speaker.strip()
-            text = text.strip()
-            if speaker in speaker_map:
-                speaker = speaker_map[speaker]
-            content.append((speaker, text))
-
-    # reescribir nuevo doc
-    new_doc = Document()
-    for speaker, text in content:
-        if speaker == interviewer:
-            p = new_doc.add_paragraph()
-            r = p.add_run(f"{speaker}: {text}")
-            r.bold = True
-        else:
-            new_doc.add_paragraph(f"{speaker}: {text}")
-
-    new_doc.save(output_docx_path)
-
-    # exportar .txt
-    output_txt_path = output_docx_path.replace(".docx", ".txt")
-    with open(output_txt_path, "w", encoding="utf-8") as f:
-        for speaker, text in content:
-            f.write(f"{speaker}: {text}\n")
-
-    return output_docx_path, output_txt_path
-
-# ======================
-# 4. ENDPOINTS FASTAPI
-# ======================
-
+# ==============================
+# 📌 Endpoint: subir audio y obtener docx
+# ==============================
 @app.post("/fireflies/subir_audio/")
-async def subir_audio_fireflies(file: UploadFile = File(...), title: str = Form(...)):
-    try:
-        temp_dir = "temp_uploads"
-        os.makedirs(temp_dir, exist_ok=True)
-        file_token = str(uuid.uuid4())
-        extension = os.path.splitext(file.filename)[1]
-        temp_path = os.path.join(temp_dir, f"{file_token}{extension}")
+async def subir_audio(file: UploadFile = File(...), title: str = Form(...)):
+    # 1. Guardar temporal
+    file_path = await save_temp_file(file)
 
-        async with aiofiles.open(temp_path, "wb") as out_file:
-            content = await file.read()
-            await out_file.write(content)
+    # 2. Crear URL pública (Render sirve /temp_audio)
+    public_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/temp_audio/{os.path.basename(file_path)}"
+    print(f"URL pública generada: {public_url}")
 
-        # ahora la URL incluye extensión
-        public_url = f"{PUBLIC_BASE_URL}/temp_audio/{file_token}{extension}"
-        print("URL pública generada:", public_url)
+    # 3. Subir a Fireflies
+    upload_title = await upload_audio_to_fireflies_via_url(public_url, title)
 
-        transcript_id = await upload_audio_to_fireflies_via_url(public_url, title)
+    # 4. Polling para obtener transcript ID
+    transcript_id = None
+    for _ in range(30):  # 30 intentos x 5s = 150s
+        transcript_id = await find_transcript_by_title(upload_title)
+        if transcript_id:
+            break
+        await asyncio.sleep(5)
 
-        # esperar transcripción
-        transcript = None
-        for _ in range(60):
-            transcript = await check_transcription_status(transcript_id)
-            if transcript and transcript["sentences"]:
-                break
-            await asyncio.sleep(5)
+    if not transcript_id:
+        raise HTTPException(status_code=500, detail="No se encontró transcript en Fireflies")
 
-        if not transcript or not transcript["sentences"]:
-            raise HTTPException(status_code=500, detail="Transcripción no completada.")
+    # 5. Polling hasta obtener texto
+    transcript_text = None
+    for _ in range(30):
+        transcript_text = await get_transcript_text(transcript_id)
+        if transcript_text:
+            break
+        await asyncio.sleep(5)
 
-        # exportar docx
-        output_dir = "output"
-        os.makedirs(output_dir, exist_ok=True)
-        output_docx_path = os.path.join(output_dir, f"{file_token}_final.docx")
-        new_doc = Document()
-        for s in transcript["sentences"]:
-            p = new_doc.add_paragraph()
-            run = p.add_run(f"{s['speaker_name']}: {s['text']}")
-            run.font.size = Pt(11)
-        new_doc.save(output_docx_path)
+    if not transcript_text:
+        raise HTTPException(status_code=500, detail="El transcript no está listo")
 
-        return JSONResponse({"message": "OK", "download_url": f"/download/{file_token}"})
+    # 6. Crear DOCX
+    doc = Document()
+    doc.add_heading(f"Transcripción: {title}", level=1)
+    doc.add_paragraph(transcript_text)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al subir audio: {e}")
+    output_path = f"{TEMP_DIR}/{uuid.uuid4()}.docx"
+    doc.save(output_path)
 
-@app.get("/temp_audio/{file_token}.{ext}")
-async def serve_temp_audio(file_token: str, ext: str):
-    path = f"temp_uploads/{file_token}.{ext}"
-    if not os.path.exists(path):
-        return JSONResponse(status_code=404, content={"message": "Archivo no encontrado"})
-    return FileResponse(path, media_type="application/octet-stream", filename=f"{file_token}.{ext}")
+    return FileResponse(output_path, filename=f"{title}.docx", media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-@app.get("/download/{file_token}")
-async def download(file_token: str):
-    pattern = f"output/{file_token}_final.docx"
-    matches = glob.glob(pattern)
-    if not matches:
-        return JSONResponse(status_code=404, content={"message": "No encontrado"})
-    return FileResponse(matches[0], filename=os.path.basename(matches[0]))
+
 
 
