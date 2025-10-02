@@ -24,7 +24,7 @@ from docx.text.paragraph import Paragraph
 # =========================
 # 🔑 Configuración Fireflies
 # =========================
-FIREFLIES_API_KEY = os.getenv("63b21b6f-aa0b-4dc6-a350-1204ec71f4e3")
+FIREFLIES_API_KEY = os.getenv("FIREFLIES_API_KEY")
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
 # Carpeta temporal para guardar audios
@@ -806,6 +806,7 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
