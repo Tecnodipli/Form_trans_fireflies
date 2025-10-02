@@ -3,4 +3,5 @@ uvicorn[standard]
 python-docx
 python-multipart
 httpx
+aiofiles
 
